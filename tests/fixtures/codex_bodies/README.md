@@ -201,6 +201,12 @@ request body to the proxy host instead.
    and `function_call_output.output`; the sanitiser rewrites those too, and the
    gate flags any environment tag or skill inventory left holding a
    non-placeholder value.
+5b. Read the `tools` array. It is byte-preserved, so the sanitiser never
+   rewrites it, and a tool description supplied by an MCP server the operator
+   runs is the one place an absolute path can reach a fixture unrewritten. The
+   gate reports it as `operator_path` rather than letting it through, which
+   means the fix is to drop or edit the declaration by hand, not to re-run the
+   sanitiser.
 6. Add the `provenance.json` entry and the table row above: origin, slug,
    transport, UTC date, `codex --version`, catalog sha256, sanitisation list,
    expected view and expected verdict.
@@ -223,10 +229,15 @@ request body to the proxy host instead.
   same string on every machine of their class (`root`, `ubuntu`, `runner`,
   `docker`, …) and names Codex's own payload vocabulary uses (`text`, `tools`,
   `model`, `shell`, …). Acting on them identifies no operator and corrupts real
-  content — running the sanitiser as `root` rewrote `\broot\b` inside
-  `<environment_context>` and inside Codex's `spawn_agent` description, which
-  `/root`'s deliberate absence from the path pattern exists to prevent. The
-  committed gate pins the pass so it never depends on the machine running it.
+  content. The committed gate pins the pass so it never depends on the machine
+  running it.
+* The absolute-path rule is a shape, not a list of roots, so `/srv`, `/opt`,
+  `/data`, `/u`, `/Volumes`, `C:\Users\…` and the devcontainer default
+  `/root/<repo>` are all the operator's. Two whole paths are cleared by value
+  because Codex itself emits them — `/abs/path/…`, the documentation
+  placeholder in its base instructions, and `/root/taskN[/task_M]`, the
+  `spawn_agent` agent-task namespace. A Codex vocabulary path this list has not
+  met yet shows up as a red gate on a fresh capture, never as a committed leak.
 * The identifier scan covers `*.json` bodies. Prose (`*.md`) and
   `provenance.json` are reviewed by a human; credential shapes are still
   rejected in every file.

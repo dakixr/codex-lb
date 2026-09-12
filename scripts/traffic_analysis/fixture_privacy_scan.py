@@ -16,6 +16,13 @@ Two passes over the same tree:
   here instead, anywhere in the file at any depth. Measured, not hypothetical: a
   ``<timezone>`` and a private skill inventory inside a
   ``function_call_output.output`` passed the sanitiser and ``--strict`` both.
+* **Operator paths** -- the same backstop for text that carries no marker at
+  all. Both marker kinds above are conditioned on a tag or a heading, so a bare
+  ``cd /srv/acme/ledger`` in a tool call's arguments tripped neither, and the
+  path kind only knew ``/home``, ``/Users``, ``/tmp`` and ``/mnt``. It now
+  judges an absolute path by shape, through the sanitiser's own
+  ``OPERATOR_PATH`` and ``names_an_operator_location``, so the two cannot
+  disagree about what an operator path is.
 
 The identifier pass deliberately skips ``*.md``: the corpus README has to be
 able to name the keys the sanitiser removes, and prose is reviewed by a human,
@@ -44,9 +51,11 @@ try:
     from scripts.traffic_analysis.artifacts import atomic_write_json
     from scripts.traffic_analysis.codex_body_sanitize import (
         ENVIRONMENT_TAGS,
+        OPERATOR_PATH,
         PLACEHOLDERS,
         is_placeholder_uuid,
         live_identity_strings,
+        names_an_operator_location,
     )
     from scripts.traffic_analysis.privacy_scan import scan_tree
 except ModuleNotFoundError:  # Allow direct script execution.
@@ -54,9 +63,11 @@ except ModuleNotFoundError:  # Allow direct script execution.
     from scripts.traffic_analysis.artifacts import atomic_write_json
     from scripts.traffic_analysis.codex_body_sanitize import (
         ENVIRONMENT_TAGS,
+        OPERATOR_PATH,
         PLACEHOLDERS,
         is_placeholder_uuid,
         live_identity_strings,
+        names_an_operator_location,
     )
     from scripts.traffic_analysis.privacy_scan import scan_tree
 
@@ -124,10 +135,6 @@ def _unsanitised_skill_inventory_pattern() -> re.Pattern[bytes]:
 
 
 _PATTERNS: tuple[tuple[str, re.Pattern[bytes]], ...] = (
-    # ``/root`` is not flagged: it identifies no operator, and Codex's own
-    # ``spawn_agent`` description documents agent task namespaces as
-    # ``/root/<task>`` -- flagging it would force mangling genuine content.
-    ("home_path", re.compile(rb"(?:/home/|/Users/|/tmp/|/mnt/)")),
     (
         "identifier_key",
         re.compile(
@@ -160,6 +167,24 @@ def _identity_patterns() -> tuple[tuple[str, re.Pattern[bytes]], ...]:
     )
 
 
+OPERATOR_PATH_KIND = "operator_path"
+
+# The sanitiser's own pattern, over bytes. Judged everywhere in the file --
+# including the ``tools`` regions the sanitiser byte-preserves, because a tool
+# description is not always Codex's own text: an MCP server the operator runs
+# supplies its own, and an absolute path in one is still the operator's. The
+# handful of paths Codex itself emits are cleared by value, in
+# ``names_an_operator_location``, which is also what keeps the sanitiser and
+# this gate from disagreeing about what an operator path is.
+_OPERATOR_PATH_BYTES = re.compile(OPERATOR_PATH.pattern.encode())
+
+
+def _names_an_operator_location(match: bytes) -> bool:
+    # A chunk boundary can split a UTF-8 sequence; a replacement character only
+    # ever makes a path *unlike* the exempt values, so the decode fails closed.
+    return names_an_operator_location(match.decode("utf-8", "replace"))
+
+
 def _chunks(path: Path) -> Iterator[bytes]:
     tail = b""
     with path.open("rb") as handle:
@@ -182,6 +207,8 @@ def identifier_findings(path: Path) -> list[str]:
             if not is_placeholder_uuid(match.group().decode()):
                 kinds.add("uuid")
                 break
+        if any(_names_an_operator_location(match.group()) for match in _OPERATOR_PATH_BYTES.finditer(sample)):
+            kinds.add(OPERATOR_PATH_KIND)
     return sorted(kinds)
 
 

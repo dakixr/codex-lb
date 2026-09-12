@@ -192,11 +192,49 @@ ENVIRONMENT_TAGS: tuple[tuple[str, str], ...] = (
     ("shell", "shell"),
 )
 _AGENTS_HEADING = re.compile(r"(?m)^(#\s+AGENTS\.md instructions for\s+)(\S.*)$")
-# Absolute paths that only ever come from the capture host. ``/root`` is
-# deliberately absent: it names no operator (it is the same string on every
-# root-run machine) while Codex's own ``spawn_agent`` description documents
-# agent task namespaces as ``/root/<task>``, which a catch-all would destroy.
-_HOST_PATH = re.compile(r"(?:/tmp|/mnt|/home/[^/\s\"'`<>,;)\]]+|/Users/[^/\s\"'`<>,;)\]]+)(?:/[^\s\"'`<>,;)\]]*)*")
+
+# An absolute filesystem path, matched as a *shape* rather than as a prefix
+# vocabulary. The four prefixes this replaced (``/tmp``, ``/mnt``,
+# ``/home/<user>``, ``/Users/<user>``) were a guess about where operators keep
+# their work, and the guess was wrong for ``/srv``, ``/opt``, ``/data``, ``/u``,
+# ``/Volumes``, the Windows profile directory and ``/root/<repo>`` -- the
+# devcontainer and ``docker run`` default. A path outside the guess reached the
+# fixture *and* passed the privacy gate whenever it carried no environment tag
+# and no skill inventory to trip the whole-file backstop.
+#
+# Anchored on both ends so widening the vocabulary does not make everything a
+# path: two or more segments, and never preceded by a word character, ``/``,
+# ``:``, ``.`` or ``\``. That leaves a relative path (``tests/unit/x.py``), a
+# URL (``https://example.com/a/b``), a prose enumeration (``cream/sand/tan``)
+# and a ``../sibling`` reference unmatched. A segment is any run of characters
+# that is not a separator, a text delimiter or a backslash, so a non-ASCII path
+# (``/home/사용자/프로젝트``) matches like any other while a regex literal
+# (``/\r?\n/``) and a JSON-escaped newline do not. ``\uXXXX`` is admitted
+# because the realistic carrier is a ``function_call``'s ``arguments``, which is
+# itself a JSON string and may arrive escaped.
+_PATH_SEGMENT = r"(?:[^\s\"'`<>,;:)\]}/\\]|\\u[0-9a-fA-F]{4})+"
+_WINDOWS_SEPARATOR = r"[\\/]{1,2}"
+OPERATOR_PATH: re.Pattern[str] = re.compile(
+    rf"(?<![A-Za-z0-9_/:.\\])(?:"
+    rf"[A-Za-z]:{_WINDOWS_SEPARATOR}{_PATH_SEGMENT}(?:{_WINDOWS_SEPARATOR}{_PATH_SEGMENT})*"
+    rf"|/{_PATH_SEGMENT}(?:/{_PATH_SEGMENT})+)"
+)
+
+# Absolute paths that name no operator, so neither the sanitiser nor the gate
+# acts on them. Both entries are measured against the committed corpus rather
+# than imagined, and both are matched against the whole path:
+#
+# * ``/abs/path/…``, the literal documentation placeholder Codex's own base
+#   instructions use for "an absolute path" (``e.g. /abs/path/app.py``);
+# * ``/root/taskN[/task_M]``, the agent-task namespace Codex's own
+#   ``spawn_agent`` description documents in the Lite tool bundle. The prefix is
+#   *not* exempt: ``/root/<repo>`` is where ``docker run`` and devcontainers keep
+#   the operator's checkout.
+#
+# Adding an entry is the only way a Codex vocabulary path stays out of the
+# findings, so the failure mode of a missing one is a red gate on a fresh
+# capture -- never a committed leak.
+_CODEX_VOCABULARY_PATH = re.compile(r"\A(?:/abs/path/|/root/task[0-9]+(?:/task_[0-9]+)*\Z)")
 # Content-part fields that carry operator text (``input_text``, ``output_text``).
 _TEXT_PART_FIELDS: tuple[str, ...] = ("text",)
 
@@ -211,9 +249,8 @@ TEXT_BEARING_ITEM_FIELDS: tuple[str, ...] = ("content", "arguments", "input", "o
 
 _MINIMUM_IDENTITY_LENGTH = 4
 
-# Host and account names this pass will not act on, for the two reasons that
-# already justify ``/root``'s absence from ``_HOST_PATH``: they identify no
-# operator, and rewriting them would corrupt genuine content.
+# Host and account names this pass will not act on: they identify no operator,
+# and rewriting them would corrupt genuine content.
 #
 # The first group is the same string on every machine of its class -- container
 # and cloud-image defaults, CI runner accounts, system accounts. The second is
@@ -310,6 +347,19 @@ def live_identity_strings() -> tuple[str, ...]:
     return identity_candidates(socket.gethostname(), getpass.getuser())
 
 
+def names_an_operator_location(path: str, placeholders: Placeholders = PLACEHOLDERS) -> bool:
+    """Whether an absolute path found by ``OPERATOR_PATH`` is the operator's.
+
+    The single predicate both this module and ``fixture_privacy_scan`` use, so
+    the sanitiser rewrites exactly what the privacy gate flags. The placeholder
+    namespace is compared by exact value, not by prefix: a second sanitiser pass
+    must be a no-op, while ``/workspace/<repo>`` -- a real devcontainer checkout
+    -- is still the operator's.
+    """
+
+    return path not in {placeholders.workspace, placeholders.skill_root} and not _CODEX_VOCABULARY_PATH.match(path)
+
+
 def is_placeholder_uuid(value: str) -> bool:
     """Whether ``value`` belongs to the fixture's placeholder UUID family."""
 
@@ -349,7 +399,12 @@ def rewrite_operator_text(text: str, placeholders: Placeholders = PLACEHOLDERS) 
             text,
         )
     text = _AGENTS_HEADING.sub(lambda m: f"{m.group(1)}{placeholders.workspace}", text)
-    text = _HOST_PATH.sub(lambda _: placeholders.workspace, text)
+    text = OPERATOR_PATH.sub(
+        lambda match: (
+            placeholders.workspace if names_an_operator_location(match.group(), placeholders) else match.group()
+        ),
+        text,
+    )
     for identity in live_identity_strings():
         text = re.sub(rf"\b{re.escape(identity)}\b", lambda _: placeholders.account, text)
     return text
@@ -382,9 +437,11 @@ def _rewrite_item_text(
     bundle lives in the item's ``tools`` array and the tool declarations live in
     the top-level ``tools``; both are Codex-generated, both are the load-bearing
     evidence for the ``not_portable_lite_namespace`` verdict, and both stay byte
-    identical. Codex's own ``spawn_agent`` description embeds ``/root/<task>``
-    agent namespaces, which a catch-all rewriter would corrupt while protecting
-    nobody -- the same reason ``/root`` is absent from ``_HOST_PATH``.
+    identical. That scoping is what lets the path rule be a general shape:
+    Codex's own ``spawn_agent`` description embeds ``/root/<task>`` agent
+    namespaces, and the walk never reaches them, so rewriting ``/root/<repo>``
+    in a transcript corrupts nothing. ``fixture_privacy_scan`` exempts the same
+    regions for the same reason.
     """
 
     for field in TEXT_BEARING_ITEM_FIELDS:

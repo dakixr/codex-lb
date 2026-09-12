@@ -179,7 +179,7 @@ def _realistic_body() -> dict[str, Any]:
         "session_id",
         "turn_id",
         "installation_id",
-        "home_path",
+        "operator_path",
         "workspace_path",
         "skill_name",
         "timezone",
@@ -420,7 +420,7 @@ def test_a_tool_call_leak_no_longer_passes_the_privacy_gate_as_well(tmp_path: Pa
 
     assert report["passed"] is False
     assert dict((finding["path"], finding["kinds"]) for finding in report["findings"])["unsanitised.json"] == [
-        "home_path",
+        "operator_path",
         "unsanitised_environment_tag",
         "unsanitised_skill_inventory",
     ]
@@ -429,6 +429,200 @@ def test_a_tool_call_leak_no_longer_passes_the_privacy_gate_as_well(tmp_path: Pa
     (tmp_path / "unsanitised.json").write_text(json.dumps(sanitised), encoding="utf-8")
 
     assert fixture_privacy_scan.scan_fixture_tree(tmp_path)["passed"] is True
+
+
+# Absolute workspace roots that carry no ``<cwd>``/``### Available skills``
+# marker and are not one of the four prefixes the path rule used to know
+# (``/tmp``, ``/mnt``, ``/home/<user>``, ``/Users/<user>``). Every one of them
+# is somebody's real checkout: ``/srv`` and ``/opt`` on a server, ``/root`` in
+# ``docker run`` and in a devcontainer, ``/data`` and ``/u`` on shared boxes,
+# ``/Volumes`` on macOS, and the Windows profile directory.
+_OPERATOR_WORKSPACES = (
+    "/srv/acme-holdings/project-bluebird",
+    "/root/acme-internal-merger",
+    "/opt/acme-holdings/ledger",
+    "/data/clients/acme-holdings",
+    "/u/jane/acme-holdings",
+    "/Volumes/AcmeHoldings/ledger",
+    "/home/사용자/프로젝트/비밀",
+    "C:\\Users\\jane.doe\\acme-holdings",
+)
+
+
+def _workspace_leak_body(workspace: str) -> dict[str, Any]:
+    """A tool call whose only operator marker is the absolute path itself.
+
+    No environment tag and no skill inventory, so neither whole-file backstop
+    kind can fire: the path is the entire evidence, exactly as it arrives in a
+    second turn's ``function_call.arguments``.
+    """
+
+    return {
+        "model": "gpt-5.5",
+        "input": [
+            {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "shell",
+                "arguments": json.dumps({"command": ["bash", "-lc", f"cd {workspace} && ls"]}),
+            },
+            {"type": "function_call_output", "call_id": "call_1", "output": f"{workspace}/README.md\n"},
+        ],
+    }
+
+
+@pytest.mark.parametrize("workspace", _OPERATOR_WORKSPACES)
+def test_an_operator_workspace_outside_the_home_vocabulary_is_rewritten(workspace: str) -> None:
+    """The path rule is a shape, not a prefix vocabulary.
+
+    A four-prefix list is a guess about where operators keep their work, and it
+    was wrong for every root here. The rule now matches an absolute path by
+    shape, so the sanitiser no longer depends on having guessed the operator's
+    filesystem layout.
+    """
+
+    sanitised, redactions = sanitize_body(_workspace_leak_body(workspace))
+
+    assert workspace not in json.dumps(sanitised), f"{workspace} survived sanitisation"
+    assert [redaction.path for redaction in redactions] == ["input[0].arguments", "input[1].output"]
+    assert PLACEHOLDERS.workspace in sanitised["input"][0]["arguments"]
+
+
+@pytest.mark.parametrize("workspace", _OPERATOR_WORKSPACES)
+def test_an_operator_workspace_outside_the_home_vocabulary_fails_the_privacy_gate(
+    workspace: str, tmp_path: Path
+) -> None:
+    """The backstop half: marker-free text used to pass ``--strict`` as well.
+
+    The two whole-file kinds are conditioned on a marker (an environment tag, a
+    skill inventory heading). A bare workspace path carries neither, so the
+    privacy gate is the *only* thing standing between a future capture and a
+    committed operator path.
+    """
+
+    (tmp_path / "candidate.json").write_text(json.dumps(_workspace_leak_body(workspace)), encoding="utf-8")
+
+    report = fixture_privacy_scan.scan_fixture_tree(tmp_path)
+
+    assert report["passed"] is False, workspace
+    assert dict((finding["path"], finding["kinds"]) for finding in report["findings"])["candidate.json"] == [
+        "operator_path"
+    ]
+
+
+def test_a_relative_path_a_url_and_a_prose_slash_list_are_not_operator_paths() -> None:
+    """The shape is anchored, so widening it did not make everything a path."""
+
+    innocuous = (
+        "See tests/unit/test_parser.py and r0/example-skill/SKILL.md, "
+        "read https://example.com/docs/guide, pick cream/sand/tan, and try ../sibling/dir."
+    )
+
+    assert codex_body_sanitize.rewrite_operator_text(innocuous) == innocuous
+
+
+def test_the_placeholder_namespace_is_not_rewritten_into_itself() -> None:
+    """Idempotence: the sanitiser's own output must not match its own path rule.
+
+    ``/workspace/skills`` is the skill-root placeholder; a rule that rewrote
+    every absolute path would collapse it onto ``/workspace/repo`` on a second
+    pass. A *different* ``/workspace`` directory is still the operator's, and is
+    still rewritten.
+    """
+
+    keep = f"roots `{PLACEHOLDERS.skill_root}` and `{PLACEHOLDERS.workspace}`"
+
+    assert codex_body_sanitize.rewrite_operator_text(keep) == keep
+    assert PLACEHOLDERS.workspace in codex_body_sanitize.rewrite_operator_text("cd /workspace/acme-ledger")
+    assert "acme-ledger" not in codex_body_sanitize.rewrite_operator_text("cd /workspace/acme-ledger")
+
+
+@pytest.mark.parametrize(
+    "name",
+    [name for name, entry in gate.PROVENANCE.items() if not entry["carries_client_telemetry"]],
+)
+def test_sanitising_a_committed_fixture_again_changes_nothing(name: str) -> None:
+    """Idempotence on the real corpus, not only on the synthetic body.
+
+    The captured fixtures carry Codex's own ``/abs/path/app.py`` documentation
+    placeholder in the base instructions; a path rule that rewrote it would
+    silently rewrite every fixture the next time one was re-sanitised. The
+    pre-strip fixtures are excluded because they exist *un*sanitised, to feed
+    production's telemetry stripper.
+    """
+
+    body = json.loads((FIXTURES / name).read_text(encoding="utf-8"))
+
+    sanitised, redactions = sanitize_body(body)
+
+    assert redactions == []
+    assert json.dumps(sanitised, sort_keys=True) == json.dumps(body, sort_keys=True), name
+
+
+def test_the_codex_agent_namespace_is_cleared_by_value_not_by_prefix(tmp_path: Path) -> None:
+    """``/root/task1`` is ``spawn_agent`` vocabulary; ``/root/<repo>`` is a checkout.
+
+    ``/root`` is the ``docker run`` and devcontainer default, so exempting the
+    prefix would blind the gate to exactly the workspace a containerised capture
+    leaks. The exemption is the whole path, and it is cleared in the sanitiser's
+    predicate so both halves agree.
+    """
+
+    bundle = {
+        "type": "additional_tools",
+        "tools": [
+            {
+                "type": "namespace",
+                "tools": [{"name": "spawn_agent", "description": "Task `/root/task1` spawns `/root/task1/task_3`."}],
+            }
+        ],
+    }
+    (tmp_path / "generated.json").write_text(json.dumps({"input": [bundle]}), encoding="utf-8")
+
+    assert fixture_privacy_scan.scan_fixture_tree(tmp_path)["passed"] is True
+
+    (tmp_path / "generated.json").write_text(
+        json.dumps({"input": [{"type": "function_call", "arguments": "cd /root/acme-internal-merger && ls"}]}),
+        encoding="utf-8",
+    )
+
+    assert fixture_privacy_scan.scan_fixture_tree(tmp_path)["passed"] is False
+
+
+def test_the_gate_judges_the_byte_preserved_tool_declarations_too(tmp_path: Path) -> None:
+    """The sanitiser cannot rewrite ``tools``; the gate is what covers it.
+
+    A tool description is not always Codex's own text -- an MCP server the
+    operator runs supplies its own -- and the sanitiser byte-preserves the array
+    because it is the load-bearing portability evidence. A path that reaches it
+    is therefore only ever caught here, and used to be caught nowhere: the
+    reproduction committed the operator's workspace twice, once in the tool call
+    and once in the declaration.
+    """
+
+    (tmp_path / "candidate.json").write_text(
+        json.dumps(
+            {
+                "model": "gpt-5.5",
+                "tools": [{"type": "function", "name": "ledger", "description": "Runs in /srv/acme-holdings/ledger."}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = fixture_privacy_scan.scan_fixture_tree(tmp_path)
+
+    assert report["findings"] == [{"path": "candidate.json", "kinds": ["operator_path"]}]
+
+
+def test_the_operator_path_backstop_still_judges_a_body_that_will_not_parse(tmp_path: Path) -> None:
+    """The pass is over bytes, so a truncated capture is judged like any other."""
+
+    (tmp_path / "truncated.json").write_text('{"input": [{"arguments": "cd /srv/acme/ledger', encoding="utf-8")
+
+    report = fixture_privacy_scan.scan_fixture_tree(tmp_path)
+
+    assert report["findings"] == [{"path": "truncated.json", "kinds": ["operator_path"]}]
 
 
 def test_the_rewriter_is_a_no_op_on_text_without_operator_markers() -> None:
@@ -576,7 +770,7 @@ def test_mutation_an_operator_home_path_fails_the_privacy_gate(tmp_path: Path) -
 
     assert report["passed"] is False
     kinds = dict((finding["path"], finding["kinds"]) for finding in report["findings"])[CAPTURED_STANDARD]
-    assert "home_path" in kinds
+    assert "operator_path" in kinds
     # The unmutated corpus passes the same scan, so the finding is the mutation's.
     assert _scan(_corpus(tmp_path / "pristine")[0])["passed"] is True
 
@@ -593,7 +787,7 @@ def test_mutation_a_skill_inventory_inside_a_tool_call_fails_the_privacy_gate(tm
 
     assert report["passed"] is False
     kinds = dict((finding["path"], finding["kinds"]) for finding in report["findings"])[CAPTURED_STANDARD]
-    assert kinds == ["unsanitised_environment_tag", "unsanitised_skill_inventory"]
+    assert kinds == ["operator_path", "unsanitised_environment_tag", "unsanitised_skill_inventory"]
     # The unmutated corpus passes the same scan, so the finding is the mutation's.
     assert _scan(_corpus(tmp_path / "pristine")[0])["passed"] is True
 
