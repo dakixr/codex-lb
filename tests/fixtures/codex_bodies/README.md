@@ -191,7 +191,7 @@ request body to the proxy host instead.
 2. Gate the corpus: `uv run python -m scripts.traffic_analysis.fixture_privacy_scan --root tests/fixtures/codex_bodies --strict`. It exits 0 on a pristine tree; the bodies allowed to keep bare telemetry key names are read from `provenance.json` (`carries_client_telemetry`) and printed, so no flags are needed.
 3. Sanity-scan the scratch directory *without* `--strict`. The raw body, the
    header sidecar and the manifest all report findings by construction — that
-   is the reminder to delete them (step 9), not a gate.
+   is the reminder to delete them (step 10), not a gate.
 4. Diff the sanitised body against the raw one and confirm only telemetry,
    paths, dates and identifiers changed.
 5. Read `instructions` and the developer prefix for `<skills_instructions>`
@@ -201,18 +201,18 @@ request body to the proxy host instead.
    and `function_call_output.output`; the sanitiser rewrites those too, and the
    gate flags any environment tag or skill inventory left holding a
    non-placeholder value.
-5b. Read the `tools` array. It is byte-preserved, so the sanitiser never
+6. Read the `tools` array. It is byte-preserved, so the sanitiser never
    rewrites it, and a tool description supplied by an MCP server the operator
    runs is the one place an absolute path can reach a fixture unrewritten. The
    gate reports it as `operator_path` rather than letting it through, which
    means the fix is to drop or edit the declaration by hand, not to re-run the
    sanitiser.
-6. Add the `provenance.json` entry and the table row above: origin, slug,
+7. Add the `provenance.json` entry and the table row above: origin, slug,
    transport, UTC date, `codex --version`, catalog sha256, sanitisation list,
    expected view and expected verdict.
-7. `uv run pytest -p no:cacheprovider -q tests/unit/test_codex_body_fixtures.py tests/unit/test_codex_body_sanitizer.py tests/unit/test_codex_body_capture_guards.py tests/unit/test_codex_body_capture_origin.py tests/unit/test_model_sources_projection.py tests/unit/test_replay_safety_portability.py`
-8. `ruff check`, `ruff format`, `ty check`.
-9. Delete the raw capture directory in the same session. Never commit a
+8. `uv run pytest -p no:cacheprovider -q tests/unit/test_codex_body_fixtures.py tests/unit/test_codex_body_sanitizer.py tests/unit/test_codex_body_capture_guards.py tests/unit/test_codex_body_capture_origin.py tests/unit/test_model_sources_projection.py tests/unit/test_replay_safety_portability.py`
+9. `ruff check`, `ruff format`, `ty check`.
+10. Delete the raw capture directory in the same session. Never commit a
    `headers-*.json` (it holds the `authorization` line even when the token was
    disposable) or a raw `body-*.json` / `prewarm-*.json`.
 

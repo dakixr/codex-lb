@@ -330,7 +330,12 @@ fields. The Codex-generated tool surface is byte preserved: the top-level
 credential shapes, which passes a tree full of live UUIDs and workspace paths on
 its own — plus a backstop for operator text the field walk may not have reached:
 an `<environment_context>` tag or a `<skills_instructions>` inventory whose
-value is not the sanitiser's placeholder, anywhere in the file at any depth.
+value is not the sanitiser's placeholder, anywhere in the file at any depth, and
+an absolute path or an account/host name recognised by the sanitiser's own
+predicates, including inside the byte-preserved `tools` array the sanitiser will
+not rewrite. Nothing in either tool is taken from the machine it runs on, so a
+capture sanitises to the same fixture and a corpus reaches the same verdict on
+every host.
 
 Never commit a `headers-*.json`: it holds the `authorization` line even when
 the token was disposable. Delete the raw capture directory in the same session.

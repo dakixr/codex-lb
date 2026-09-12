@@ -26,8 +26,11 @@ Three rules, in tension, decided in this order:
    ``not_portable_history``, and deleting it would hide that fact from the
    fixture corpus. Pass ``strip_item_ids=True`` for the stripped variant.
 
-``tools`` is byte-preserved: it is Codex-generated, carries no operator data,
-and is the load-bearing evidence for the tool-declaration portability gaps.
+``tools`` is byte-preserved: it is the load-bearing evidence for the
+tool-declaration portability gaps, and rewriting it would change the recorded
+verdict. It is not *assumed* to be operator-free -- an MCP server the operator
+runs supplies its own descriptions -- so ``fixture_privacy_scan`` judges the
+array this sanitiser will not touch, and a finding there is fixed by hand.
 
 A websocket capture is persisted verbatim, so it arrives with the transport's
 frame envelope (``type``) around the Responses body. That envelope is removed
