@@ -20,7 +20,6 @@ from __future__ import annotations
 import getpass
 import json
 import shutil
-from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -51,20 +50,16 @@ CAPTURED_STANDARD = "captured_gpt55_standard_http.json"
 CAPTURED_LITE = "captured_gpt56sol_lite_http.json"
 SYNTHETIC_STANDARD = "gpt55_standard_first_turn.json"
 
-_FIXED_IDENTITIES = ("capture-host-name", "capture-operator")
+# Account and host names in the shapes the sanitiser recognises: a shell prompt
+# and a home directory reference. A bare mention in prose is deliberately not
+# one of them -- see ``test_the_identity_shapes_are_rewritten_...`` in the gate.
+_FIXED_ACCOUNT = "capture-operator"
+_FIXED_HOST = "capture-host-name"
+_FIXED_PROMPT = f"{_FIXED_ACCOUNT}@{_FIXED_HOST}"
 
 _LIVE_SESSION = "0199f2c1-2b3d-4e5f-8a9b-1c2d3e4f5a6b"
 _LIVE_TURN = "0199f2c1-3c4e-5f60-9bac-2d3e4f5a6b7c"
 _LIVE_INSTALLATION = "0199f2c1-4d5f-6071-acbd-3e4f5a6b7c8d"
-
-
-@pytest.fixture(autouse=True)
-def _fixed_identities(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """Pin the host/account pass so the suite is machine-independent."""
-
-    monkeypatch.setattr(codex_body_sanitize, "live_identity_strings", lambda: _FIXED_IDENTITIES)
-    monkeypatch.setattr(fixture_privacy_scan, "live_identity_strings", lambda: _FIXED_IDENTITIES)
-    yield
 
 
 def _realistic_body() -> dict[str, Any]:
@@ -125,7 +120,7 @@ def _realistic_body() -> dict[str, Any]:
                     },
                     {
                         "type": "input_text",
-                        "text": f"Reviewed by {_FIXED_IDENTITIES[1]} on {_FIXED_IDENTITIES[0]}.",
+                        "text": f"Reviewed at {_FIXED_PROMPT}:~{_FIXED_ACCOUNT}/checkout$ pytest.",
                     },
                 ],
             },
@@ -172,8 +167,8 @@ def _realistic_body() -> dict[str, Any]:
         "private-runbook",
         "Europe/Berlin",
         "2026-09-11",
-        _FIXED_IDENTITIES[0],
-        _FIXED_IDENTITIES[1],
+        _FIXED_HOST,
+        _FIXED_ACCOUNT,
     ],
     ids=[
         "session_id",
@@ -220,7 +215,8 @@ def test_every_placeholder_lands_verbatim_in_the_output() -> None:
     heading = sanitised["input"][1]["content"][0]["text"]
     assert heading.startswith(f"# AGENTS.md instructions for {PLACEHOLDERS.workspace}")
     identities = sanitised["input"][1]["content"][2]["text"]
-    assert identities == f"Reviewed by {PLACEHOLDERS.account} on {PLACEHOLDERS.account}."
+    account = PLACEHOLDERS.account
+    assert identities == f"Reviewed at {account}@{account}:~{account}/checkout$ pytest."
 
 
 def test_telemetry_fields_go_whole_and_the_cache_key_becomes_a_placeholder() -> None:
@@ -758,7 +754,7 @@ def test_mutation_a_live_cache_key_fails_the_privacy_gate(tmp_path: Path) -> Non
     assert "uuid" in dict((finding["path"], finding["kinds"]) for finding in report["findings"])[CAPTURED_LITE]
 
 
-def test_mutation_an_operator_home_path_fails_the_privacy_gate(tmp_path: Path) -> None:
+def test_mutation_an_operator_workspace_path_fails_the_privacy_gate(tmp_path: Path) -> None:
     """The identifier pass exists because the credential scanner has no path vocabulary."""
 
     root, provenance = _corpus(tmp_path)

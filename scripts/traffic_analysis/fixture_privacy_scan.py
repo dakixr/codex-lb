@@ -23,6 +23,13 @@ Two passes over the same tree:
   judges an absolute path by shape, through the sanitiser's own
   ``OPERATOR_PATH`` and ``names_an_operator_location``, so the two cannot
   disagree about what an operator path is.
+* **Operator identities** -- an account or host name, recognised by the shape
+  that makes it one (``jane@build-box``, ``~jane/``, ``HOSTNAME=build-box``)
+  rather than by asking this machine what it is called. The pass this replaced
+  matched ``\\bhostname\\b`` from ``socket.gethostname()``: 36 of 57 plausible
+  host names red-lined the *pristine* corpus, with no flag to clear the finding,
+  because a Codex body is mostly English prose. The shape catches another
+  operator's host too, which the ambient pass never could.
 
 The identifier pass deliberately skips ``*.md``: the corpus README has to be
 able to name the keys the sanitiser removes, and prose is reviewed by a human,
@@ -53,8 +60,8 @@ try:
         ENVIRONMENT_TAGS,
         OPERATOR_PATH,
         PLACEHOLDERS,
+        carries_operator_identity,
         is_placeholder_uuid,
-        live_identity_strings,
         names_an_operator_location,
     )
     from scripts.traffic_analysis.privacy_scan import scan_tree
@@ -65,8 +72,8 @@ except ModuleNotFoundError:  # Allow direct script execution.
         ENVIRONMENT_TAGS,
         OPERATOR_PATH,
         PLACEHOLDERS,
+        carries_operator_identity,
         is_placeholder_uuid,
-        live_identity_strings,
         names_an_operator_location,
     )
     from scripts.traffic_analysis.privacy_scan import scan_tree
@@ -160,13 +167,7 @@ _PATTERNS: tuple[tuple[str, re.Pattern[bytes]], ...] = (
 )
 
 
-def _identity_patterns() -> tuple[tuple[str, re.Pattern[bytes]], ...]:
-    return tuple(
-        ("live_identity", re.compile(rb"\b" + re.escape(identity.encode()) + rb"\b"))
-        for identity in live_identity_strings()
-    )
-
-
+OPERATOR_IDENTITY_KIND = "operator_identity"
 OPERATOR_PATH_KIND = "operator_path"
 
 # The sanitiser's own pattern, over bytes. Judged everywhere in the file --
@@ -185,6 +186,21 @@ def _names_an_operator_location(match: bytes) -> bool:
     return names_an_operator_location(match.decode("utf-8", "replace"))
 
 
+def _sample_kinds(sample: bytes) -> Iterator[str]:
+    """The kinds decided from one chunk, as the sanitiser's own predicates see it.
+
+    Neither of these can be a bare pattern in ``_PATTERNS``: both are
+    value-conditioned on the placeholder the sanitiser writes, and both are
+    defined as "the sanitiser would have rewritten this" so the gate cannot
+    drift from the rewriter it backs.
+    """
+
+    if any(_names_an_operator_location(match.group()) for match in _OPERATOR_PATH_BYTES.finditer(sample)):
+        yield OPERATOR_PATH_KIND
+    if carries_operator_identity(sample.decode("utf-8", "replace")):
+        yield OPERATOR_IDENTITY_KIND
+
+
 def _chunks(path: Path) -> Iterator[bytes]:
     tail = b""
     with path.open("rb") as handle:
@@ -198,17 +214,15 @@ def identifier_findings(path: Path) -> list[str]:
     """Identifier-shaped kinds found in ``path``; never the offending value."""
 
     kinds: set[str] = set()
-    patterns = _PATTERNS + _identity_patterns()
     for sample in _chunks(path):
-        for label, pattern in patterns:
+        for label, pattern in _PATTERNS:
             if pattern.search(sample):
                 kinds.add(label)
         for match in _UUID.finditer(sample):
             if not is_placeholder_uuid(match.group().decode()):
                 kinds.add("uuid")
                 break
-        if any(_names_an_operator_location(match.group()) for match in _OPERATOR_PATH_BYTES.finditer(sample)):
-            kinds.add(OPERATOR_PATH_KIND)
+        kinds.update(_sample_kinds(sample))
     return sorted(kinds)
 
 

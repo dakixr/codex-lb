@@ -46,12 +46,12 @@ their credential values were disposable.
 - **GIVEN** a candidate fixture body under `tests/fixtures/codex_bodies/`
 - **WHEN** it contains a credential shape, a non-placeholder UUID, an absolute
   filesystem path under any root other than the placeholder namespace and the
-  paths the Codex client itself emits, an email address, the scanning host's own
-  identity, an environment-context tag or skill inventory still holding a value
-  the sanitiser would have replaced — wherever in the body it sits, including
-  inside a tool call's arguments, a tool result's output and the byte-preserved
-  tool declarations — or a Codex telemetry key the fixture has not declared it
-  carries
+  paths the Codex client itself emits, an email address, an account or host name
+  in a shape that identifies it as one, an environment-context tag or skill
+  inventory still holding a value the sanitiser would have replaced — wherever
+  in the body it sits, including inside a tool call's arguments, a tool result's
+  output and the byte-preserved tool declarations — or a Codex telemetry key the
+  fixture has not declared it carries
 - **THEN** the fixture privacy scan fails and names the finding kinds
 - **AND** the report does not echo the offending value
 
@@ -161,11 +161,15 @@ the removal empties it, and MUST replace the prompt cache key, every input-item
 identifier and every nested identifier with fixed placeholders drawn from a
 recognisable placeholder family. It MUST rewrite the operator-identifying
 strings — absolute filesystem paths recognised by shape rather than by a list of
-roots, the capture date, the timezone, the shell, the agent-instructions file
+roots, account and host names recognised by the shape that identifies them as
+such, the capture date, the timezone, the shell, the agent-instructions file
 heading, and the skill roots table together with the skill inventory — in every
 text-bearing field of an input item, including the
 arguments of a tool call and the output of a tool result in both their string
-and their list-of-parts form, and not only in a message's content. It MUST NOT add a field that the
+and their list-of-parts form, and not only in a message's content. Neither the
+sanitiser nor the privacy scan may take any part of its vocabulary from the
+machine it runs on, so a capture sanitises to the same fixture and a corpus
+reaches the same verdict on every host. It MUST NOT add a field that the
 captured body did not carry, because the portability view declines unknown
 top-level fields and a fabricated key would change the recorded verdict. It
 MUST leave the standard tool array and the Responses-Lite additional-tools

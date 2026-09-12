@@ -223,14 +223,20 @@ request body to the proxy host instead.
   real upstream catalog and the operator's real skills — none of which the
   body-level gate reads, at the cost of a real upstream request and quota.
   Recorded as a deliberate v1 limitation.
-* The host/account identity pass only recognises the machine running the
-  sanitiser and the scanner. Another operator's hostname is invisible to it.
-* It also skips `codex_body_sanitize.GENERIC_IDENTITY_NAMES`: names that are the
-  same string on every machine of their class (`root`, `ubuntu`, `runner`,
-  `docker`, …) and names Codex's own payload vocabulary uses (`text`, `tools`,
-  `model`, `shell`, …). Acting on them identifies no operator and corrupts real
-  content. The committed gate pins the pass so it never depends on the machine
-  running it.
+* The host/account identity pass recognises an account or host name by the
+  *shape* that makes it one — `jane@build-box` (shell prompt, ssh target,
+  email), `~jane/` (home directory), `HOSTNAME=build-box` (and `USER`,
+  `USERNAME`, `LOGNAME`, `HOST`). A bare mention in free text — "deploy to
+  claw" — is not detectable by shape and is left to the review step above.
+  Absolute paths, including `/home/<user>` and `C:\Users\<user>`, are covered by
+  the path rule on every machine.
+* Neither the sanitiser nor the gate reads `socket.gethostname()` or
+  `getpass.getuser()`, so the fixture a capture sanitises to, and the verdict
+  the gate reaches, are the same on every machine. The pass this replaced
+  matched a bare word taken from the running box: 36 of 57 plausible host names
+  red-lined the *pristine* corpus (`repo` hit all four fixtures) with no flag to
+  clear the finding, and on a host called `exec` the sanitiser rewrote Codex's
+  own `functions.exec` tool namespace. The gate test tries all 57.
 * The absolute-path rule is a shape, not a list of roots, so `/srv`, `/opt`,
   `/data`, `/u`, `/Volumes`, `C:\Users\…` and the devcontainer default
   `/root/<repo>` are all the operator's. Two whole paths are cleared by value

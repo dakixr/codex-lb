@@ -18,9 +18,11 @@ portable" is meaningless without knowing which client version produced it.
 
 from __future__ import annotations
 
+import getpass
 import hashlib
 import json
 import re
+import socket
 from pathlib import Path
 from typing import Any, cast
 
@@ -43,18 +45,11 @@ from scripts.traffic_analysis import codex_body_sanitize, fixture_privacy_scan
 from scripts.traffic_analysis.codex_body_capture import DEFAULT_CATALOG
 from scripts.traffic_analysis.codex_body_sanitize import (
     DROPPED_TOP_LEVEL_FIELDS,
-    GENERIC_IDENTITY_NAMES,
     SANITISED_STREAM_OPTIONS_KEYS,
     SHAPE_PRESERVED_TOP_LEVEL_FIELDS,
-    identity_candidates,
 )
 
 pytestmark = pytest.mark.unit
-
-_FIXED_IDENTITIES = ("capture-host-name", "capture-operator")
-# Captured before the autouse fixture replaces it, so the skip list can be
-# exercised through the real function rather than around it.
-_LIVE_IDENTITY_STRINGS = codex_body_sanitize.live_identity_strings
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "codex_bodies"
 PROVENANCE_NAME = "provenance.json"
@@ -95,23 +90,6 @@ def _provenance() -> dict[str, dict[str, Any]]:
 
 PROVENANCE = _provenance()
 FIXTURE_NAMES = sorted(PROVENANCE)
-
-
-@pytest.fixture(autouse=True)
-def _machine_independent_identity_pass(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Pin the host/account pass, as ``test_codex_body_sanitizer`` already does.
-
-    Without it the committed gate depended on the name of the machine running
-    it. Simulated with ``getpass.getuser()`` returning ``root`` -- the default in
-    ``docker run``, in devcontainers, in many self-hosted runner images and under
-    ``sudo pytest`` -- ``scan_fixture_tree`` failed with ``live_identity`` on
-    *both* captured fixtures, matching ``<special>:root</special>`` and Codex's
-    own ``spawn_agent`` description, and the finding could not be cleared
-    because the sanitiser deliberately preserves ``/root``.
-    """
-
-    monkeypatch.setattr(codex_body_sanitize, "live_identity_strings", lambda: _FIXED_IDENTITIES)
-    monkeypatch.setattr(fixture_privacy_scan, "live_identity_strings", lambda: _FIXED_IDENTITIES)
 
 
 def _body_files() -> list[str]:
@@ -328,47 +306,81 @@ def test_the_documented_privacy_gate_command_passes_verbatim() -> None:
     assert fixture_privacy_scan.main(["--root", str(FIXTURES), "--strict"]) == 0
 
 
-@pytest.mark.parametrize("identity", sorted(GENERIC_IDENTITY_NAMES))
-def test_the_privacy_gate_passes_whatever_generic_name_the_host_carries(
+# Plausible host and account names, none of them exotic: cloud-image and
+# container defaults, hardware and OS names, project words, and the words a
+# Codex payload's own English prose uses. Every one of them red-lined the
+# pristine corpus while the identity pass matched a bare word against a body
+# that is mostly natural-language text, and none of them could be cleared.
+_PLAUSIBLE_HOST_NAMES = (
+    "alpha", "apply", "assistant", "beta", "call", "claw", "cloud", "cluster", "code", "command", "content",
+    "context", "core", "data", "delta", "desktop", "developer", "edit", "exec", "false", "file", "home", "image",
+    "jane", "laptop", "linux", "list", "macbook", "macos", "message", "node", "office", "open", "output", "patch",
+    "path", "pixel", "plan", "prime", "read", "repo", "sandbox", "server", "session", "studio", "system", "task",
+    "thinkpad", "titan", "tower", "true", "turn", "vault", "wait", "write", "wsl",
+)  # fmt: skip
+
+
+@pytest.mark.parametrize("identity", _PLAUSIBLE_HOST_NAMES)
+def test_the_documented_gate_command_passes_whatever_the_host_is_called(
     identity: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Measured machine-independence, not a claim: every skipped name is tried.
+    """Machine-independence, measured through the ambient sources themselves.
 
-    A `live_identity` finding on a name that identifies no operator is
-    unactionable — the sanitiser preserves `/root` and Codex's own vocabulary on
-    purpose, so there is nothing to change in the fixture.
+    Patched on `socket` and `getpass` rather than on this package, so the claim
+    survives a future pass that reads the machine some other way: what is
+    asserted is that the runbook step exits 0 no matter what the box is called.
     """
 
-    monkeypatch.setattr(codex_body_sanitize.socket, "gethostname", lambda: identity)
-    monkeypatch.setattr(codex_body_sanitize.getpass, "getuser", lambda: identity)
-    monkeypatch.setattr(codex_body_sanitize, "live_identity_strings", _LIVE_IDENTITY_STRINGS)
-    monkeypatch.setattr(fixture_privacy_scan, "live_identity_strings", _LIVE_IDENTITY_STRINGS)
+    monkeypatch.setattr(socket, "gethostname", lambda: identity)
+    monkeypatch.setattr(getpass, "getuser", lambda: identity)
 
-    report = fixture_privacy_scan.scan_fixture_tree(FIXTURES)
-
-    assert report["passed"] is True, f"host/account {identity!r}: {report['findings']}"
+    assert fixture_privacy_scan.main(["--root", str(FIXTURES), "--strict"]) == 0, identity
 
 
-def test_a_distinctive_operator_identity_is_still_reported(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """The skip list narrows the identity pass; it does not disable it."""
+@pytest.mark.parametrize("identity", ["exec", "repo", "content", "true"])
+def test_sanitising_a_committed_fixture_does_not_depend_on_the_host_name(
+    identity: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other half: the *output* must not depend on who ran the sanitiser.
 
-    monkeypatch.setattr(fixture_privacy_scan, "live_identity_strings", lambda: ("bespoke-build-box",))
+    On a host called `exec` the bare-word pass rewrote Codex's own
+    `functions.exec` tool namespace to the account placeholder, so two operators
+    sanitising the same capture produced different fixtures.
+    """
+
+    monkeypatch.setattr(socket, "gethostname", lambda: identity)
+    monkeypatch.setattr(getpass, "getuser", lambda: identity)
+    body = json.loads((FIXTURES / "captured_gpt56sol_lite_http.json").read_text(encoding="utf-8"))
+
+    sanitised, redactions = codex_body_sanitize.sanitize_body(body)
+
+    assert redactions == []
+    assert json.dumps(sanitised, sort_keys=True) == json.dumps(body, sort_keys=True), identity
+
+
+def test_a_distinctive_operator_identity_is_still_reported(tmp_path: Path) -> None:
+    """The pass is narrower but no longer ambient: a prompt names its own host."""
+
     candidate = tmp_path / "candidate.json"
     candidate.write_text(
-        json.dumps({"input": [{"content": "captured on bespoke-build-box tonight"}]}),
+        json.dumps({"input": [{"content": "jane@bespoke-build-box:~jane/ledger$ make"}]}),
         encoding="utf-8",
     )
 
     report = fixture_privacy_scan.scan_fixture_tree(tmp_path)
 
-    assert report["findings"] == [{"path": "candidate.json", "kinds": ["live_identity"]}]
+    assert report["findings"] == [{"path": "candidate.json", "kinds": ["operator_identity"]}]
 
 
-def test_a_default_account_name_is_not_treated_as_an_identity() -> None:
-    """A distinctive hostname still is, even when the account name is a default."""
+def test_the_identity_shapes_are_rewritten_and_the_payload_vocabulary_is_not() -> None:
+    """What the shape buys: an account name is redacted, English prose is not."""
 
-    assert identity_candidates("bespoke-build-box", "root") == ("bespoke-build-box",)
-    assert identity_candidates("runner", "runner") == ()
-    assert identity_candidates("claw", "operator") == ("operator", "claw")
-    # Deterministic on a length tie: iterating a set made the order hash-dependent.
-    assert identity_candidates("zeta", "beta") == ("beta", "zeta")
+    rewrite = codex_body_sanitize.rewrite_operator_text
+
+    assert rewrite("ssh jane@bespoke-build-box") == "ssh codex-fixture@codex-fixture"
+    assert rewrite("cat ~jane/notes.md") == "cat ~codex-fixture/notes.md"
+    assert rewrite('HOSTNAME="bespoke-build-box"') == 'HOSTNAME="codex-fixture"'
+    for vocabulary in ("call functions.exec", "the repo is dirty", '"role": "developer"', '"@@ " | "@@"'):
+        assert rewrite(vocabulary) == vocabulary
+    # Idempotent: the replacement is itself one of the shapes.
+    assert rewrite(rewrite("ssh jane@bespoke-build-box")) == "ssh codex-fixture@codex-fixture"

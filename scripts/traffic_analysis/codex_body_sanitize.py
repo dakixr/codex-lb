@@ -39,9 +39,7 @@ from __future__ import annotations
 
 import argparse
 import copy
-import getpass
 import re
-import socket
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -247,104 +245,53 @@ _TEXT_PART_FIELDS: tuple[str, ...] = ("text",)
 TEXT_BEARING_ITEM_FIELDS: tuple[str, ...] = ("content", "arguments", "input", "output", "summary")
 
 
-_MINIMUM_IDENTITY_LENGTH = 4
-
-# Host and account names this pass will not act on: they identify no operator,
-# and rewriting them would corrupt genuine content.
+# Account and host names, matched by the *shape* that makes a token an account
+# or a host name rather than by the name of the machine running this script.
 #
-# The first group is the same string on every machine of its class -- container
-# and cloud-image defaults, CI runner accounts, system accounts. The second is
-# vocabulary Codex's own payload uses, measured against the committed corpus.
-# Both were reachable, not hypothetical: with ``getpass.getuser()`` returning
-# ``root`` (the default in ``docker run``, in devcontainers, in many self-hosted
-# runner images and under ``sudo pytest``) the identity pass matched
-# ``<special>:root</special>`` and Codex's ``spawn_agent`` description in both
-# captured fixtures, so the privacy gate reported a ``live_identity`` finding
-# that no operator could clear -- while the sanitiser rewrote ``\broot\b`` inside
-# ``<environment_context>`` and destroyed the evidence the design keeps. Of 33
-# plausible host/account names tried, 24 hit at least one committed fixture.
-GENERIC_IDENTITY_NAMES: frozenset[str] = frozenset(
-    {
-        # Defaults and system accounts.
-        "admin",
-        "administrator",
-        "alpine",
-        "builder",
-        "centos",
-        "codespace",
-        "container",
-        "daemon",
-        "debian",
-        "devcontainer",
-        "docker",
-        "fedora",
-        "guest",
-        "jenkins",
-        "localhost",
-        "nobody",
-        "root",
-        "runner",
-        "ubuntu",
-        "user",
-        "users",
-        "vagrant",
-        # Codex payload vocabulary.
-        "agent",
-        "auto",
-        "bash",
-        "build",
-        "codex",
-        "custom",
-        "function",
-        "high",
-        "input",
-        "local",
-        "main",
-        "medium",
-        "model",
-        "name",
-        "shell",
-        "store",
-        "stream",
-        "test",
-        "text",
-        "tools",
-        "type",
-        "work",
-    }
+# The pass this replaced read ``socket.gethostname()`` and ``getpass.getuser()``
+# and rewrote ``\bname\b`` anywhere in the body, minus a hand-enumerated list of
+# ~45 "generic" names. Both halves were unsound against a payload that is mostly
+# English prose: of 57 plausible host names tried, 36 red-lined the *pristine*
+# corpus with an unclearable finding (``repo`` hit all four fixtures, ``true``
+# and ``developer`` five files), and on a host called ``exec`` the sanitiser
+# rewrote Codex's own ``functions.exec`` tool namespace, so two operators
+# sanitising one capture produced different fixtures. The list could not be
+# completed, either: any dictionary word is somebody's hostname.
+#
+# These three shapes are machine-independent, so they also catch *another*
+# operator's host -- which the ambient pass never could -- and the general
+# absolute-path rule above already covers ``/home/<user>`` and ``C:\Users\<user>``
+# on every machine rather than only on that user's own. What is given up is a
+# bare mention of the capture host in free text ("deploy to claw"): undetectable
+# by shape, and left to the README's review step.
+_ACCOUNT_AT_HOST = re.compile(r"(?<![A-Za-z0-9_.+@-])[A-Za-z0-9_][A-Za-z0-9._-]{1,31}@[A-Za-z][A-Za-z0-9.-]{1,63}")
+# Only with the trailing separator: ``~jane/`` is a home directory, ``~half`` is
+# prose and ``~/`` names nobody.
+_HOME_REFERENCE = re.compile(r"(?<![A-Za-z0-9_.~-])~[A-Za-z_][A-Za-z0-9._-]{0,31}/")
+_IDENTITY_ASSIGNMENT = re.compile(
+    r"\b((?:USER|USERNAME|LOGNAME|HOSTNAME|HOST)\s*=\s*[\"\']?)[A-Za-z0-9][A-Za-z0-9._-]*"
 )
 
 
-def identity_candidates(hostname: str, username: str) -> tuple[str, ...]:
-    """The identity strings worth rewriting, longest first then alphabetical.
+def _replace_operator_identities(text: str, placeholders: Placeholders) -> str:
+    """Rewrite every account/host shape to the account placeholder, in place."""
 
-    Deterministic on purpose: the replacement order is part of the sanitiser's
-    output, and iterating a set made ties depend on hash order.
+    account = placeholders.account
+    text = _ACCOUNT_AT_HOST.sub(lambda _: f"{account}@{account}", text)
+    text = _HOME_REFERENCE.sub(lambda _: f"~{account}/", text)
+    return _IDENTITY_ASSIGNMENT.sub(lambda match: f"{match.group(1)}{account}", text)
+
+
+def carries_operator_identity(text: str, placeholders: Placeholders = PLACEHOLDERS) -> bool:
+    """Whether ``text`` still names an account or a host the sanitiser would replace.
+
+    Defined as "the sanitiser would change this", so the privacy gate cannot
+    drift from the rewriter it backs -- the same relationship
+    ``names_an_operator_location`` gives the path rule. The replacement is itself
+    one of the shapes, so a sanitised body answers ``False``.
     """
 
-    candidates = {hostname, username}
-    return tuple(
-        sorted(
-            (
-                name
-                for name in candidates
-                if len(name) >= _MINIMUM_IDENTITY_LENGTH and name.casefold() not in GENERIC_IDENTITY_NAMES
-            ),
-            key=lambda name: (-len(name), name),
-        )
-    )
-
-
-def live_identity_strings() -> tuple[str, ...]:
-    """The running host and account names, minus the ones that name no operator.
-
-    Only caught for the machine that runs the sanitiser (and the scanner): the
-    same value from another operator's host is invisible here. That, and
-    ``GENERIC_IDENTITY_NAMES``, are the documented limits of this pass rather
-    than a claim of completeness.
-    """
-
-    return identity_candidates(socket.gethostname(), getpass.getuser())
+    return _replace_operator_identities(text, placeholders) != text
 
 
 def names_an_operator_location(path: str, placeholders: Placeholders = PLACEHOLDERS) -> bool:
@@ -405,9 +352,7 @@ def rewrite_operator_text(text: str, placeholders: Placeholders = PLACEHOLDERS) 
         ),
         text,
     )
-    for identity in live_identity_strings():
-        text = re.sub(rf"\b{re.escape(identity)}\b", lambda _: placeholders.account, text)
-    return text
+    return _replace_operator_identities(text, placeholders)
 
 
 def _rewritten(value: str, path: str, placeholders: Placeholders, redactions: list[Redaction]) -> str:
