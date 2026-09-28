@@ -524,6 +524,23 @@ def _websocket_payload_is_account_neutral_fresh_replay(payload: dict[str, JsonVa
     if event_type is not None and event_type != "response.create":
         return False
     payload.pop("type", None)
+    metadata = payload.get("client_metadata")
+    if isinstance(metadata, dict):
+        # Codex 0.158 adds client-side trace identities. These are portable
+        # labels, unlike upstream response IDs or learned turn-state tokens.
+        trace_keys = {
+            "session_id",
+            "thread_id",
+            "turn_id",
+            "parent_turn_id",
+            "root_turn_id",
+            "ws_request_header_traceparent",
+            "ws_request_header_tracestate",
+            "x-codex-ws-stream-request-start-ms",
+        }
+        if any(not isinstance(value, str) or not value.strip() for key, value in metadata.items() if key in trace_keys):
+            return False
+        payload["client_metadata"] = {key: value for key, value in metadata.items() if key not in trace_keys}
     reasoning = payload.get("reasoning")
     if (
         _payload_uses_responses_lite(payload)
@@ -829,6 +846,51 @@ def _project_websocket_full_resend_for_replay(
     return projected_payload
 
 
+def _project_websocket_client_recovery_payload(payload: dict[str, JsonValue]) -> dict[str, JsonValue] | None:
+    """An unanchored client retry supplies its authoritative full input window."""
+    items = payload.get("input")
+    if payload.get("previous_response_id") is not None or not isinstance(items, list) or not items:
+        return None
+    projection = project_responses_input_for_account_neutral_fresh_replay(items, stored_count=len(items))
+    if projection is None:
+        return None
+    projected = {**payload, "input": projection.input_items}
+    return projected if _websocket_payload_is_account_neutral_fresh_replay(projected) else None
+
+
+def _websocket_request_client_owner_recovery(request_state: _WebSocketRequestState) -> bool:
+    """Request full context only before output and without another hard owner."""
+    continuity = request_state.client_recovery_continuity
+    owner = request_state.preferred_account_id
+    if (
+        not request_state.previous_response_owner_recovery_allowed
+        or not request_state.expose_stale_previous_response_classifier
+        or request_state.previous_response_id is None
+        or owner is None
+        or continuity is None
+        or request_state.response_id is not None
+        or request_state.response_event_count != 0
+        or request_state.last_downstream_sequence_number is not None
+        or request_state.file_required_preferred_account
+        or request_state.affinity_policy.codex_session_source == "turn_state"
+    ):
+        return False
+    continuity.unavailable_owner_account_id = owner
+    # Codex retains this learned body token across its full-history reconnect.
+    # Remember only the retired token, so later requests cannot send it to the
+    # replacement account. An explicit handshake owner remains protected above.
+    if request_state.request_text is not None:
+        try:
+            request_payload = json.loads(request_state.request_text)
+        except json.JSONDecodeError:
+            request_payload = None
+        metadata = request_payload.get("client_metadata") if isinstance(request_payload, dict) else None
+        token = metadata.get("x-codex-turn-state") if isinstance(metadata, dict) else None
+        if isinstance(token, str):
+            continuity.retired_client_turn_state = token
+    return True
+
+
 _WEBSOCKET_TOOL_CALL_ITEM_TYPES_BY_OUTPUT_TYPE = {
     "function_call_output": "function_call",
     "custom_tool_call_output": "custom_tool_call",
@@ -896,6 +958,7 @@ def _record_websocket_continuity_completion(
     if response_id is None:
         _retire_websocket_continuity_anchor(continuity_state)
         return
+    continuity_state.unavailable_owner_account_id = None
     # Record the completed response id and pending tool-call metadata
     # regardless of input shape (string inputs leave ``input_item_count`` at
     # 0), so an anchored follow-up can still match continuity and receive
@@ -1722,6 +1785,16 @@ def _rewrite_websocket_previous_response_owner_unavailable_event(
         error_type="server_error",
         response_id=_websocket_downstream_response_id(request_state),
     )
+    if _websocket_request_client_owner_recovery(request_state):
+        rewritten_event_payload = {
+            "type": "error",
+            "status": 400,
+            "error": {
+                "code": PREVIOUS_RESPONSE_NOT_FOUND_CODE,
+                "type": "invalid_request_error",
+                "message": PREVIOUS_RESPONSE_NOT_FOUND_MESSAGE,
+            },
+        }
     rewritten_text = json.dumps(rewritten_event_payload, ensure_ascii=True, separators=(",", ":"))
     rewritten_event_block = format_sse_event(rewritten_event_payload)
     rewritten_payload = parse_sse_data_json(rewritten_event_block)

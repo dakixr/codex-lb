@@ -67,6 +67,7 @@ from app.core.clock import Clock, Scheduler, clock_for, scheduler_for
 from app.core.errors import (
     PREVIOUS_RESPONSE_MALFORMED_PARAM_REASON,
     PREVIOUS_RESPONSE_NOT_FOUND_CODE,
+    PREVIOUS_RESPONSE_NOT_FOUND_MESSAGE,
     STREAM_INCOMPLETE_ANCHOR_NEUTRAL_MESSAGES,
     OpenAIErrorEnvelope,
     OpenAIErrorParam,
@@ -416,6 +417,7 @@ from app.modules.proxy._service.websocket.helpers import (
     _pop_terminal_websocket_request_state,
     _prepare_websocket_request_state_for_account_switch,
     _prepare_websocket_request_state_for_auth_replay,
+    _project_websocket_client_recovery_payload,
     _record_or_defer_websocket_accepted_replay_health,
     _record_websocket_continuity_completion,
     _record_websocket_responses_lite_acceptance,
@@ -434,6 +436,7 @@ from app.modules.proxy._service.websocket.helpers import (
     _upstream_websocket_disconnect_message,
     _websocket_accepted_replay_can_switch_account,
     _websocket_accepted_replay_may_exclude_account,
+    _websocket_affinity_may_resolve_hard_owner,
     _websocket_auth_failure_requires_reauth,
     _websocket_capability_metadata_values,
     _websocket_client_previous_response_full_resend_is_retry_safe,
@@ -454,6 +457,7 @@ from app.modules.proxy._service.websocket.helpers import (
     _websocket_precreated_replay_fallback_error,
     _websocket_precreated_retry_error_code,
     _websocket_receive_timeout_for_pending_requests,
+    _websocket_request_client_owner_recovery,
     _websocket_response_id,
     _wrapped_websocket_error_event,
 )
@@ -498,7 +502,11 @@ from app.modules.proxy.http_bridge_forwarding import (
 from app.modules.proxy.http_bridge_forwarding import (
     OwnerForwardRelayFailure as OwnerForwardRelayFailure,
 )
-from app.modules.proxy.load_balancer import AccountLease, effective_account_concurrency_caps
+from app.modules.proxy.load_balancer import (
+    CONTINUITY_OWNER_UNAVAILABLE,
+    AccountLease,
+    effective_account_concurrency_caps,
+)
 from app.modules.proxy.request_policy import (
     apply_api_key_enforcement,
     apply_enforced_service_tier_model_fallback,
@@ -2208,7 +2216,10 @@ class _WebSocketMixin:
                     request_state is not None
                     and upstream is not None
                     and account is not None
-                    and request_state.affinity_policy.abandon_unavailable_legacy_owner
+                    and (
+                        request_state.affinity_policy.abandon_unavailable_legacy_owner
+                        or account.id in request_state.excluded_account_ids
+                    )
                 ):
                     # Reusing the existing socket would bypass sticky
                     # selection, so the unavailable raw owner would never be
@@ -2612,6 +2623,10 @@ class _WebSocketMixin:
                                 scheduler=scheduler_for(proxy),
                             )
                         continue
+                    # Selection-time recovery may replace the anchored body.
+                    # Dispatch exactly the body selection proved movable.
+                    if request_state.request_text is not None:
+                        text_data = request_state.request_text
                     await release_current_account_lease()
                     account_lease = request_state.websocket_stream_lease
                     request_state.websocket_stream_lease = None
@@ -3223,6 +3238,14 @@ class _WebSocketMixin:
             headers=headers,
             preserve_existing_responses_lite=trusted_incremental_responses_lite,
         )
+        if (
+            codex_session_affinity
+            and continuity_state is not None
+            and continuity_state.retired_client_turn_state is not None
+            and client_metadata is not None
+            and client_metadata.get("x-codex-turn-state") == continuity_state.retired_client_turn_state
+        ):
+            client_metadata = {key: value for key, value in client_metadata.items() if key != "x-codex-turn-state"}
         next_responses_lite_model = (
             responses_payload.model if body_uses_responses_lite or trusted_incremental_responses_lite else None
         )
@@ -3271,6 +3294,24 @@ class _WebSocketMixin:
         validate_model_access(refreshed_api_key, responses_payload.model)
         proxy._raise_for_unsupported_input_image_references(responses_payload)
         rewritten_file_account_id = await proxy._resolve_file_account_for_responses(responses_payload, headers)
+        recovery_owner = (
+            continuity_state.unavailable_owner_account_id
+            if continuity_state is not None and codex_session_affinity
+            else None
+        )
+        recovery_input = None
+        if recovery_owner is not None and responses_payload.previous_response_id is None:
+            recovery_input = responses_payload.input
+            projected = _project_websocket_client_recovery_payload(dict(responses_payload.to_payload()))
+            if projected is None or rewritten_file_account_id is not None:
+                raise ProxyResponseError(
+                    502,
+                    openai_error(
+                        "previous_response_owner_unavailable",
+                        "Full conversation contains state that cannot move to another account.",
+                    ),
+                )
+            responses_payload = ResponsesRequest.model_validate(projected)
         original_full_resend_payload: ResponsesRequest | None = None
         original_input_item_count: int | None = None
         original_input_fingerprint: str | None = None
@@ -3283,7 +3324,7 @@ class _WebSocketMixin:
         goal_restart_full_resend = _request_allows_unavailable_legacy_owner_abandonment(responses_payload)
         restart_affinity_payload = responses_payload
         session_anchor = None
-        if not goal_restart_full_resend:
+        if not goal_restart_full_resend and recovery_input is None:
             session_anchor = _websocket_continuity_anchor_for_payload(
                 continuity_state,
                 responses_payload=responses_payload,
@@ -3374,6 +3415,13 @@ class _WebSocketMixin:
         request_state.source_route_excluded = source_route_excluded
         request_state.responses_lite_model = next_responses_lite_model
         request_state.expose_stale_previous_response_classifier = codex_session_affinity
+        request_state.client_recovery_continuity = continuity_state if codex_session_affinity else None
+        if recovery_input is not None and recovery_owner is not None:
+            request_state.excluded_account_ids.add(recovery_owner)
+            request_state.request_stage = "reattach"
+            if isinstance(recovery_input, list):
+                request_state.input_item_count = len(recovery_input)
+                request_state.input_full_fingerprint = _facade()._fingerprint_input_items(recovery_input)
         request_state.require_security_work_authorized = capability_route.require_security_work_authorized
         request_state.durable_capability_lineage_required = capability_route.require_security_work_authorized
         original_full_resend_input: JsonValue | None = None
@@ -3467,6 +3515,14 @@ class _WebSocketMixin:
             api_key=api_key,
             synthesized_turn_state=synthesized_turn_state,
         )
+        if recovery_input is not None:
+            if affinity_policy.codex_session_source == "turn_state":
+                await proxy._release_websocket_request_state_reservation(request_state)
+                raise ProxyResponseError(
+                    502,
+                    openai_error("previous_response_owner_unavailable", "Conversation requires its original owner."),
+                )
+            affinity_policy = replace(affinity_policy, reallocate_sticky=True, abandon_unavailable_legacy_owner=True)
         affinity_observation = AffinityObservation.from_policy(
             affinity_policy,
             synthesized_turn_state=synthesized_turn_state,
@@ -3754,6 +3810,9 @@ class _WebSocketMixin:
                 # starts, a connection/open failure belongs to the replacement.
                 _clear_websocket_precreated_replay_fallback(request_state)
 
+            if request_state.previous_response_id is None and request_state.excluded_account_ids:
+                headers = {key: value for key, value in headers.items() if key.lower() != "x-codex-turn-state"}
+
             try:
                 connect_result = await proxy._try_open_websocket_connect_attempt(
                     account,
@@ -3980,6 +4039,28 @@ class _WebSocketMixin:
                 raise
 
             account = selection.account
+            owner_unavailable = (
+                account is None
+                and require_preferred_account
+                and preferred_account_id is not None
+                and selection.error_code in {USAGE_LIMIT_REACHED, CONTINUITY_OWNER_UNAVAILABLE, "no_accounts"}
+            )
+            if owner_unavailable:
+                request_state.previous_response_owner_recovery_allowed = True
+                if (
+                    request_state.previous_response_id is not None
+                    and not request_state.file_required_preferred_account
+                    and not _websocket_affinity_may_resolve_hard_owner(request_state.affinity_policy)
+                    and _prepare_websocket_request_state_for_account_switch(request_state) is not None
+                ):
+                    exclude_account_ids.add(preferred_account_id)
+                    request_state.excluded_account_ids.add(preferred_account_id)
+                    request_state.request_stage = "reattach"
+                    request_state.affinity_policy = replace(request_state.affinity_policy, reallocate_sticky=True)
+                    preferred_account_id = None
+                    require_preferred_account = False
+                    reallocate_sticky = True
+                    continue
             if account is not None:
                 break
             if selection.error_code == USAGE_LIMIT_REACHED:
@@ -5899,6 +5980,8 @@ class _WebSocketMixin:
             and request_state.fresh_upstream_request_is_retry_safe
             and request_state.fresh_upstream_request_text
         )
+        if retry_error_code == USAGE_LIMIT_REACHED and not has_other_pending_requests:
+            request_state.previous_response_owner_recovery_allowed = True
         if (
             not accepted_lifecycle_replay
             and retry_error_code in _facade()._WEBSOCKET_TRANSPARENT_REPLAY_ERROR_CODES
@@ -5907,10 +5990,12 @@ class _WebSocketMixin:
             and not retry_safe_previous_response_not_found
             and not retry_safe_owner_replay
         ):
-            await proxy._handle_stream_error(
-                account,
-                {"message": _websocket_event_error_message(event_type, payload) or "Upstream error"},
-                retry_error_code,
+            await _record_or_defer_websocket_accepted_replay_health(
+                proxy,
+                request_state,
+                account=account,
+                error_message=_websocket_event_error_message(event_type, payload),
+                error_code=cast(str, retry_error_code),
             )
             event, payload, event_type, downstream_text = _rewrite_websocket_previous_response_owner_unavailable_event(
                 request_state=request_state,
@@ -5919,10 +6004,12 @@ class _WebSocketMixin:
         if retry_safe_owner_replay and not retry_safe_previous_response_not_found:
             safe_request_text = _prepare_websocket_request_state_for_account_switch(request_state)
             if safe_request_text is None:
-                await proxy._handle_stream_error(
-                    account,
-                    {"message": _websocket_event_error_message(event_type, payload) or "Upstream error"},
-                    retry_error_code,
+                await _record_or_defer_websocket_accepted_replay_health(
+                    proxy,
+                    request_state,
+                    account=account,
+                    error_message=_websocket_event_error_message(event_type, payload),
+                    error_code=cast(str, retry_error_code),
                 )
                 event, payload, event_type, downstream_text = (
                     _rewrite_websocket_previous_response_owner_unavailable_event(
@@ -6828,6 +6915,17 @@ class _WebSocketMixin:
                 scheduler=scheduler_for(proxy),
             )
         async with client_send_lock:
+            if error_code == "previous_response_owner_unavailable" and _websocket_request_client_owner_recovery(
+                request_state
+            ):
+                # Stock Codex retries this top-level error with its complete
+                # local history. Keep the original class in the request log.
+                payload = openai_error(
+                    PREVIOUS_RESPONSE_NOT_FOUND_CODE,
+                    PREVIOUS_RESPONSE_NOT_FOUND_MESSAGE,
+                    error_type="invalid_request_error",
+                )
+                status_code = 400
             await websocket.send_text(
                 _serialize_websocket_error_event(
                     _wrapped_websocket_error_event(

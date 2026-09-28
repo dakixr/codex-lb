@@ -197,6 +197,17 @@ Healthy websocket signals:
 
 If you run `codex-lb` behind a reverse proxy, make sure it forwards WebSocket upgrades — see [Remote Access](deployment/remote.md).
 
+### Continuing after an account reaches its limit
+
+Codex CLI 0.158 can automatically resend its local conversation when a
+WebSocket continuation loses its account. The proxy then selects another
+eligible account when that context is portable. No payload cache or extra
+configuration is required. A brief reconnect may appear during recovery.
+
+Uploaded files and opaque server-owned context can still require their original
+account. See the [Responses compatibility specification](https://github.com/Soju06/codex-lb/tree/main/openspec/specs/responses-api-compat)
+for the recovery contract and limits.
+
 ### Migrating from direct OpenAI (session retagging)
 
 `codex resume` filters by `model_provider`; old sessions won't appear until you re-tag them. Use the built-in retag command instead of editing Codex files by hand; see [Codex session retagging](https://github.com/Soju06/codex-lb/blob/main/openspec/specs/runtime-portability/context.md#codex-session-retagging) for backups, Docker, WSL, and rollback details.

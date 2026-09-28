@@ -128,3 +128,110 @@ def test_size_slimmed_resend_does_not_preserve_client_fingerprint() -> None:
     assert state.input_full_fingerprint == proxy_service._fingerprint_input_items(
         cast(list[JsonValue], slimmed["input"])
     )
+
+
+@pytest.mark.parametrize(
+    "protected", ["file", "turn_state", "created", "event", "sequence", "not_native", "policy", "no_anchor"]
+)
+def test_owner_recovery_signal_respects_independent_ownership_and_output(protected):
+    from app.modules.proxy._service.websocket.helpers import _websocket_request_client_owner_recovery
+
+    continuity = proxy_service._WebSocketContinuityState()
+    state = proxy_service._WebSocketRequestState(
+        request_id="recovery",
+        model="gpt-5.4",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=0.0,
+        previous_response_id="resp_old",
+        preferred_account_id="account_a",
+        client_recovery_continuity=continuity,
+        previous_response_owner_recovery_allowed=True,
+        expose_stale_previous_response_classifier=True,
+    )
+    if protected == "file":
+        state.file_required_preferred_account = True
+    elif protected == "turn_state":
+        state.affinity_policy = proxy_service._AffinityPolicy(codex_session_source="turn_state")
+    elif protected == "created":
+        state.response_id = "resp_accepted"
+    elif protected == "event":
+        state.response_event_count = 1
+    elif protected == "sequence":
+        state.last_downstream_sequence_number = 0
+    elif protected == "not_native":
+        state.expose_stale_previous_response_classifier = False
+    elif protected == "policy":
+        state.previous_response_owner_recovery_allowed = False
+    elif protected == "no_anchor":
+        state.previous_response_id = None
+    assert not _websocket_request_client_owner_recovery(state)
+    assert continuity.unavailable_owner_account_id is None
+
+
+@pytest.mark.parametrize(
+    "item",
+    [
+        {"type": "compaction", "encrypted_content": "opaque"},
+        {"type": "item_reference", "id": "old_item"},
+        {"type": "function_call_output", "call_id": "missing_call", "output": "result"},
+        {"role": "user", "content": [{"type": "input_file", "file_id": "old_file"}]},
+    ],
+)
+def test_client_recovery_projection_rejects_nonportable_history(item):
+    from app.modules.proxy._service.websocket.helpers import _project_websocket_client_recovery_payload
+
+    payload = {"model": "gpt-5.4", "input": [{"role": "user", "content": "hello"}, item]}
+    assert _project_websocket_client_recovery_payload(payload) is None
+
+
+@pytest.mark.parametrize(
+    ("metadata", "portable"),
+    [
+        ({"session_id": "session", "thread_id": "thread", "turn_id": "turn"}, True),
+        ({"thread_id": {"id": "owner"}}, False),
+        ({"thread_id": " "}, False),
+        ({"unknown_owner": "owner"}, False),
+        ({"x-codex-turn-state": "owner"}, False),
+    ],
+)
+def test_native_trace_metadata_is_portable_but_owner_state_is_not(metadata, portable):
+    payload = {"model": "gpt-5.4", "input": [{"role": "user", "content": "hello"}], "client_metadata": metadata}
+    assert _websocket_request_text_is_account_neutral_fresh_replay(json.dumps(payload)) is portable
+
+
+@pytest.mark.parametrize(
+    ("tool", "portable"),
+    [
+        ({"type": "namespace", "name": "functions", "tools": [{"type": "function", "name": "read"}]}, True),
+        (
+            {
+                "type": "namespace",
+                "name": "functions",
+                "tools": [{"type": "file_search", "vector_store_ids": ["vs_old"]}],
+            },
+            False,
+        ),
+        (
+            {
+                "type": "namespace",
+                "name": "functions",
+                "tools": [{"type": "function", "name": "read", "container_id": "old"}],
+            },
+            False,
+        ),
+        ({"type": "namespace", "name": "functions", "tools": []}, False),
+        (
+            {"type": "namespace", "name": "functions", "tools": [{"type": "namespace", "name": "nested", "tools": []}]},
+            False,
+        ),
+        ({"type": "web_search", "external_web_access": False}, True),
+        ({"type": "web_search", "external_web_access": True}, True),
+        ({"type": "web_search", "external_web_access": "true"}, False),
+        ({"type": "web_search", "external_web_access": {"file_id": "old"}}, False),
+    ],
+)
+def test_native_tool_declarations_preserve_account_ownership(tool, portable):
+    payload = {"model": "gpt-5.4", "input": [{"role": "user", "content": "hello"}], "tools": [tool]}
+    assert _websocket_request_text_is_account_neutral_fresh_replay(json.dumps(payload)) is portable

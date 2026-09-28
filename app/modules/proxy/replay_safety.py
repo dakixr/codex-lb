@@ -22,11 +22,12 @@ _ACCOUNT_NEUTRAL_REPLAY_OMITTED_ITEM_TYPES = frozenset(
 )
 _INTERNAL_CHAT_MESSAGE_METADATA_FIELD = "internal_chat_message_metadata_passthrough"
 _ACCOUNT_NEUTRAL_INTERNAL_CHAT_MESSAGE_METADATA_FIELDS = frozenset({"turn_id"})
-_ACCOUNT_NEUTRAL_TOOL_TYPES = frozenset({"custom", "function", "web_search", "web_search_preview"})
+_ACCOUNT_NEUTRAL_TOOL_TYPES = frozenset({"custom", "function", "namespace", "web_search", "web_search_preview"})
 _ACCOUNT_NEUTRAL_TOOL_DECLARATION_FIELDS = {
     "custom": frozenset({"description", "format", "name", "type"}),
     "function": frozenset({"description", "name", "parameters", "strict", "type"}),
-    "web_search": frozenset({"filters", "search_context_size", "type", "user_location"}),
+    "namespace": frozenset({"description", "name", "tools", "type"}),
+    "web_search": frozenset({"external_web_access", "filters", "search_context_size", "type", "user_location"}),
     "web_search_preview": frozenset({"filters", "search_context_size", "type", "user_location"}),
 }
 _ACCOUNT_NEUTRAL_TOOL_CHOICE_STRINGS = frozenset({"auto", "none", "required"})
@@ -824,11 +825,23 @@ def _tool_declaration_is_account_neutral(tool: Mapping[str, JsonValue]) -> bool:
         return False
     if any(key not in _ACCOUNT_NEUTRAL_TOOL_DECLARATION_FIELDS[tool_type] for key in tool):
         return False
-    if _contains_account_scoped_tool_state(tool):
-        return False
-    if tool_type in {"custom", "function"} and not _is_nonblank_string(tool.get("name")):
+    if tool_type in {"custom", "function", "namespace"} and not _is_nonblank_string(tool.get("name")):
         return False
     if tool.get("description") is not None and not isinstance(tool.get("description"), str):
+        return False
+    if tool_type == "namespace":
+        children = tool.get("tools")
+        return (
+            isinstance(children, list)
+            and bool(children)
+            and all(
+                isinstance(child, dict)
+                and child.get("type") in ("custom", "function")
+                and _tool_declaration_is_account_neutral(child)
+                for child in children
+            )
+        )
+    if _contains_account_scoped_tool_state(tool):
         return False
     if tool_type == "function":
         return (tool.get("parameters") is None or isinstance(tool.get("parameters"), dict)) and (
@@ -843,6 +856,8 @@ def _web_search_tool_options_are_account_neutral(
     tool_type: str,
     tool: Mapping[str, JsonValue],
 ) -> bool:
+    if "external_web_access" in tool and not isinstance(tool["external_web_access"], bool):
+        return False
     filters = tool.get("filters")
     if filters is not None:
         if not isinstance(filters, dict) or not set(filters) <= _ACCOUNT_NEUTRAL_WEB_SEARCH_FILTER_FIELDS:

@@ -10267,7 +10267,7 @@ def test_backend_responses_websocket_retries_stale_account_model_route_on_anothe
     )
 
 
-def test_backend_responses_websocket_previous_response_usage_limit_returns_upstream_unavailable(
+def test_backend_responses_websocket_previous_response_usage_limit_requests_client_history(
     app_instance,
     monkeypatch,
 ):
@@ -10379,9 +10379,8 @@ def test_backend_responses_websocket_previous_response_usage_limit_returns_upstr
             websocket.send_text(json.dumps(request_payload))
             event = json.loads(websocket.receive_text())
 
-    assert event["type"] == "response.failed"
-    assert event["response"]["error"]["code"] == "upstream_unavailable"
-    assert event["response"]["error"]["message"] == "Previous response owner account is unavailable; retry later."
+    assert event["type"] == "error"
+    _assert_previous_response_not_found_error(event["error"])
     assert connect_models == ["gpt-5.1"]
     assert captured_preferred_accounts == ["acct_ws_proxy_owner"]
     assert handled_error_codes == ["usage_limit_reached"]
@@ -14071,7 +14070,8 @@ def test_backend_responses_websocket_quota_replay_projects_verified_full_resend(
             assert [event["type"] for event in events] == ["response.created", "response.output_text.delta", "error"]
             assert events[-1]["error"]["code"] == "usage_limit_reached"
         else:
-            assert events[-1]["response"]["error"]["code"] == "upstream_unavailable"
+            assert events[-1]["type"] == "error"
+            _assert_previous_response_not_found_error(events[-1]["error"])
         assert failover.connect_accounts == [failover.FIRST_ACCOUNT_ID]
         assert recovered_upstream.sent_text == []
         return
@@ -14578,3 +14578,191 @@ def test_backend_responses_websocket_re_sends_an_anchored_accepted_failure_in_a_
     assert "previous_response_id" not in replayed_payload
     assert replayed_payload["input"] == [failover.HISTORICAL_INPUT, failover.FOLLOW_UP_INPUT]
     assert other_account_upstream.sent_text == []
+
+
+@pytest.mark.parametrize("failure_stage", ["selection", "selection_full", "quota"])
+@pytest.mark.parametrize(
+    ("session_headers", "reconnect"),
+    [
+        ({}, False),
+        ({"session_id": "recovery-session", "x-codex-thread-id": "recovery-thread"}, False),
+        ({"session_id": "recovery-session", "x-codex-thread-id": "recovery-thread"}, True),
+    ],
+)
+def test_codex_owner_loss_requests_full_context_then_continues_on_replacement(
+    app_instance, monkeypatch, failure_stage, session_headers, reconnect
+):
+    """Exercise the stock CLI error/retry exchange through the public WS route."""
+    from contextlib import ExitStack
+
+    from app.modules.proxy.load_balancer import AccountSelection
+
+    user = {"role": "user", "content": "original question"}
+    reasoning = {"type": "reasoning", "id": "rs_old", "encrypted_content": "old-account", "summary": []}
+    answer = {
+        "type": "message",
+        "id": "msg_old",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": "prior answer"}],
+    }
+    followup = {"role": "user", "content": "continue"}
+    batches = [_completed_first_turn_upstream_batch("resp_recovery_old")]
+    if failure_stage.startswith("selection"):
+        batches[0].append(_FakeUpstreamMessage("close", close_code=1000))
+    else:
+        batches.append(
+            [_ws_event({"type": "error", "error": {"code": "usage_limit_reached", "message": "Quota exhausted"}})]
+        )
+    first = _SequencedUpstreamWebSocket([], deferred_message_batches=batches)
+    second = _SequencedUpstreamWebSocket(
+        [],
+        deferred_message_batches=[
+            _completed_first_turn_upstream_batch("resp_recovery_new"),
+            _completed_first_turn_upstream_batch("resp_recovery_next"),
+        ],
+    )
+    a = SimpleNamespace(id="recovery_account_a", codex_installation_id="installation_a", security_work_authorized=False)
+    b = SimpleNamespace(id="recovery_account_b", codex_installation_id="installation_b", security_work_authorized=False)
+    selections = []
+    opened = []
+
+    async def select_account(self, deadline, **kwargs):
+        selections.append(kwargs)
+        if len(selections) == 1:
+            return AccountSelection(account=a, error_message=None)
+        if kwargs.get("preferred_account_id") == a.id:
+            return AccountSelection(account=None, error_code="usage_limit_reached", error_message="Owner exhausted")
+        assert a.id in kwargs["exclude_account_ids"]
+        return AccountSelection(account=b, error_message=None)
+
+    async def open_attempt(self, account, headers, **kwargs):
+        opened.append((account.id, dict(headers)))
+        return account, first if account.id == a.id else second
+
+    class SettingsCache:
+        async def get(self):
+            return _websocket_settings(sse_keepalive_interval_seconds=0.5)
+
+    monkeypatch.setattr(proxy_api_module, "_websocket_firewall_denial_response", AsyncMock(return_value=None))
+    monkeypatch.setattr(proxy_api_module, "validate_proxy_api_key_authorization", AsyncMock(return_value=None))
+    monkeypatch.setattr(proxy_module, "get_settings_cache", lambda: SettingsCache())
+    monkeypatch.setattr(proxy_module.ProxyService, "_select_account_with_budget_compatible", select_account)
+    monkeypatch.setattr(proxy_module.ProxyService, "_try_open_websocket_connect_attempt", open_attempt)
+    monkeypatch.setattr(proxy_module.ProxyService, "_handle_stream_error", AsyncMock())
+    headers = {"Authorization": "Bearer external-token", **session_headers}
+    request_options = {
+        "tools": [
+            {"type": "namespace", "name": "functions", "tools": [{"type": "function", "name": "exec"}]},
+            {"type": "web_search", "external_web_access": False},
+        ],
+        "tool_choice": "auto",
+    }
+    metadata = (
+        {
+            "x-codex-turn-state": "learned-old-owner-token",
+            "session_id": "recovery-session",
+            "thread_id": "recovery-thread",
+            "turn_id": "recovery-turn",
+            "x-codex-window-id": "recovery-window",
+            "ws_request_header_traceparent": "00-12345678901234567890123456789012-1234567890123456-01",
+            "x-codex-ws-stream-request-start-ms": "1790592000000",
+        }
+        if session_headers
+        else {}
+    )
+    with TestClient(app_instance) as client:
+        with ExitStack() as sockets:
+            ws = sockets.enter_context(client.websocket_connect("/backend-api/codex/responses", headers=headers))
+            ws.send_json({"type": "response.create", "model": "gpt-5.4", "input": [user], **request_options})
+            events, _ = _receive_until_terminal(ws)
+            assert events[-1]["type"] == "response.completed"
+            ws.send_json(
+                {
+                    "type": "response.create",
+                    "model": "gpt-5.4",
+                    **({"previous_response_id": "resp_recovery_old"} if failure_stage != "selection_full" else {}),
+                    "input": [user, reasoning, answer, followup] if failure_stage == "selection_full" else [followup],
+                    "client_metadata": metadata,
+                    **request_options,
+                }
+            )
+            events, _ = _receive_until_terminal(ws)
+            if failure_stage != "selection_full" or session_headers:
+                assert events[-1]["type"] == "error", events
+                _assert_previous_response_not_found_error(events[-1]["error"])
+                assert "resp_recovery_old" not in json.dumps(events[-1])
+                if reconnect:
+                    sockets.close()
+                    ws = sockets.enter_context(
+                        client.websocket_connect("/backend-api/codex/responses", headers=headers)
+                    )
+                # Stock Codex rebuilds this from its local history after the error.
+                full = [user, reasoning, answer, followup]
+                ws.send_json(
+                    {
+                        "type": "response.create",
+                        "model": "gpt-5.4",
+                        "input": full,
+                        "client_metadata": metadata,
+                        **request_options,
+                    }
+                )
+                events, _ = _receive_until_terminal(ws)
+            assert events[-1]["type"] == "response.completed", events
+            ws.send_json(
+                {
+                    "type": "response.create",
+                    "model": "gpt-5.4",
+                    "previous_response_id": "resp_recovery_new",
+                    "input": [{"role": "user", "content": "next"}],
+                    "client_metadata": metadata,
+                    **request_options,
+                }
+            )
+            events, _ = _receive_until_terminal(ws)
+            assert events[-1]["type"] == "response.completed", events
+    assert [entry[0] for entry in opened] == [a.id, b.id]
+    assert "x-codex-turn-state" not in opened[1][1]
+    rebuilt = json.loads(second.sent_text[0])
+    assert "previous_response_id" not in rebuilt
+    assert rebuilt["tools"] == request_options["tools"]
+    assert rebuilt["input"] == [user, {k: v for k, v in answer.items() if k != "id"}, followup]
+    assert json.loads(second.sent_text[1])["previous_response_id"] == "resp_recovery_new"
+    assert all("learned-old-owner-token" not in sent for sent in second.sent_text)
+    if session_headers:
+        assert rebuilt["client_metadata"]["thread_id"] == "recovery-thread"
+    if session_headers:
+        assert selections[-1]["abandon_unavailable_legacy_owner"] is True
+
+
+@pytest.mark.parametrize(
+    "opaque_item",
+    [
+        {"type": "compaction", "encrypted_content": "old-account"},
+        {"type": "function_call_output", "call_id": "missing", "output": "result"},
+    ],
+)
+def test_codex_owner_recovery_rejects_nonportable_client_retry(app_instance, monkeypatch, opaque_item):
+    continuity = proxy_module._WebSocketContinuityState(unavailable_owner_account_id="old-owner")
+    connect = AsyncMock(side_effect=AssertionError("Unsafe history must never reach an upstream account"))
+    monkeypatch.setattr(proxy_api_module, "_websocket_firewall_denial_response", AsyncMock(return_value=None))
+    monkeypatch.setattr(proxy_api_module, "validate_proxy_api_key_authorization", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        proxy_module.ProxyService, "_websocket_continuity_state_for_request", lambda *args, **kwargs: continuity
+    )
+    monkeypatch.setattr(proxy_module.ProxyService, "_try_open_websocket_connect_attempt", connect)
+    with TestClient(app_instance) as client:
+        with client.websocket_connect(
+            "/backend-api/codex/responses", headers={"Authorization": "Bearer external-token", "session_id": "recovery"}
+        ) as ws:
+            ws.send_json(
+                {
+                    "type": "response.create",
+                    "model": "gpt-5.4",
+                    "input": [{"role": "user", "content": "continue"}, opaque_item],
+                }
+            )
+            events, _ = _receive_until_terminal(ws)
+            assert events[-1]["type"] == "error"
+            assert events[-1]["error"]["code"] == "previous_response_owner_unavailable"
+    connect.assert_not_awaited()

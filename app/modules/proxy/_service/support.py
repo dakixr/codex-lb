@@ -1129,6 +1129,9 @@ class _WebSocketRequestState:
     fresh_upstream_request_is_retry_safe: bool = False
     # Verified prefix boundary before direct-WebSocket anchor injection.
     fresh_upstream_request_stored_input_count: int | None = None
+    # Metadata only: lets a native client resend its own history after owner loss.
+    client_recovery_continuity: _WebSocketContinuityState | None = None
+    previous_response_owner_recovery_allowed: bool = False
     # Memo for the account installation-id stamp applied to ``request_text`` /
     # ``fresh_upstream_request_text`` on the HTTP bridge submit path. The stamp
     # is re-applied at several submit and retry sites; these fields remember the
@@ -1553,6 +1556,8 @@ def _http_bridge_session_supports_service_tier(
 
 @dataclass(slots=True)
 class _WebSocketContinuityState:
+    unavailable_owner_account_id: str | None = None
+    retired_client_turn_state: str | None = None
     last_completed_input_count: int = 0
     last_completed_response_id: str | None = None
     last_completed_input_prefix_fingerprint: str | None = None

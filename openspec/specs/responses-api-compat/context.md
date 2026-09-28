@@ -320,3 +320,16 @@ Canonical background JSON acknowledgements with status `queued` or `in_progress`
 ## Detached retirement sweep deadline
 
 Issue #2149 bounds aggregate detached-session lock waiting during request finalization. A sweep shares five seconds: if its first attempt consumes three seconds, the next receives two, and later attempts stop at expiry. Deferred generations remain tracked for later requests and their lifecycle owners. The deadline does not cancel resource-close owners or replace their existing close timeout.
+
+
+## Native Codex account recovery (September 2026)
+
+An exhausted response owner used to strand Codex CLI delta requests on that account. This recovery builds on [upstream PR #2398](https://github.com/Soju06/codex-lb/pull/2398), by dakixr, and extends it to account-selection failures and native client retries. [PR #2428](https://github.com/Soju06/codex-lb/pull/2428) is a separate durable HTTP transcript library; this fix does not introduce that storage.
+
+For example, account A completes a turn, then exhausts quota before accepting a continuation. A verified portable full resend can move directly to B. A delta instead receives a sanitized top-level WebSocket `error` with status 400 and `previous_response_not_found`. Codex 0.158 closes its socket and retries with its full local context. The proxy projects out response-owned bookkeeping and item IDs, validates the complete unanchored window, excludes A, and selects B. The following turn anchors to B. The old body routing token is suppressed on subsequent requests if Codex retains it.
+
+The existing API-key-scoped, bounded continuity cache retains only the unavailable account ID and retired token in addition to its prior metadata. There is no new prompt cache, payload database, migration, or setting. An unanchored client retry is authoritative for its current context window, including plain-text compaction; the proxy does not manufacture missing delta history. A restart or cache eviction loses the recovery marker, so this is not durable transcript reconstruction.
+
+Uploaded files, explicit handshake turn-state ownership, opaque compaction/items, unpaired tool outputs, visible response output, and authorization restrictions remain protected. Current Codex client tracing labels, namespaces of local function/custom tools, and the boolean web-search external-access flag are portable; unknown metadata and hosted tool state are not. A fresh routing token that differs from the retired token is retained.
+
+The local installed CLI was verified against a mock WebSocket endpoint: the standard error causes a reconnect and full resend. Public-route regressions cover quota rejection, selection-time owner failure, reconnect, retained body token, subsequent turns, and nonportable-history refusal. This does not replay or edit a user's original CLI session.
